@@ -18,6 +18,16 @@ Its 20-second deadline covers fetching headers and reading/parsing the body. Req
 **Local abort or timeout does not guarantee that vendor work or charges stopped.** Transport errors also leave upstream acceptance unknown.
 This bounds the Supadata attempt, not the existing YouTube-direct strategy or entire analysis flow.
 
+The adapter also bounds response allocation: at most 8 MiB of actual streamed
+bytes before JSON parsing, 65,536 chunks (including empty chunks), 20,000 segments, 16,384 raw characters per segment,
+and 2,000,000 aggregate raw transcript characters before normalization. An
+excessive `Content-Length` causes early refusal; missing or deceptive lengths
+never disable the streamed byte ceiling. Exceeding a limit returns
+`unknown_upstream_acceptance` with reason `response_limit`, retaining known
+billing metadata and the caller's uncertain/spent quarantine. It does not mean
+caption absence or permission to resubmit. Unread, oversized, timed-out or
+cancelled bodies are cancelled and active reader locks are released.
+
 ## Outcomes and handoff for cache/admission callers
 
 The adapter returns a discriminated `SupadataTranscriptResult` with safe `metadata` on every outcome.

@@ -41,7 +41,7 @@ vi.mock('node:timers/promises', async importOriginal => {
 });
 import { POST as transcript } from '@/app/api/transcript/route';
 import { POST as intent } from '@/app/api/analysis-intents/route';
-import { SUPADATA_TIMEOUT_MS, supadataNativeCacheIdentity } from '@/lib/supadata-transcript-provider';
+import { SUPADATA_TIMEOUT_MS, SUPADATA_MAX_RESPONSE_BYTES, supadataNativeCacheIdentity } from '@/lib/supadata-transcript-provider';
 
 const cluster = readTestPostgres('cache');
 const local = cluster !== null;
@@ -198,17 +198,25 @@ describe.skipIf(!local)('real transcript route + cache/spend RPCs on independent
     expect(state.paid).not.toHaveBeenCalled();
   });
 
-  it('actual provider timeout retains spend and blocks immediate cross-identity retries', async () => {
+  it.each(['timeout', 'response_limit'])('actual provider %s retains spend and blocks immediate cross-identity retries', async reason => {
     const flow = await newFlow();
-    state.paid.mockImplementation(() => new Promise<Response>(() => {}));
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    if (reason === 'timeout') {
+      state.paid.mockImplementation(() => new Promise<Response>(() => {}));
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    } else {
+      state.paid.mockResolvedValue(Response.json({}, { headers: {
+        'content-length': String(SUPADATA_MAX_RESPONSE_BYTES + 1), 'x-billable-requests': '1',
+      } }));
+    }
     const pending = transcript(request(flow));
-    await vi.waitFor(() => expect(state.paid).toHaveBeenCalledTimes(1), { timeout: 5000 });
-    await vi.advanceTimersByTimeAsync(SUPADATA_TIMEOUT_MS + 1);
+    if (reason === 'timeout') {
+      await vi.waitFor(() => expect(state.paid).toHaveBeenCalledTimes(1), { timeout: 5000 });
+      await vi.advanceTimersByTimeAsync(SUPADATA_TIMEOUT_MS + 1);
+    }
     vi.useRealTimers();
-    const timeout = await pending;
-    expect(timeout.status).toBe(504);
-    expect(await timeout.json()).toMatchObject({ outcome: 'unknown_upstream_acceptance', reason: 'timeout' });
+    const response = await pending;
+    expect(response.status).toBe(reason === 'timeout' ? 504 : 502);
+    expect(await response.json()).toMatchObject({ outcome: 'unknown_upstream_acceptance', reason });
     expect(await sql("SELECT state FROM public.transcript_spend_attempts")).toBe('uncertain');
     state.user = { id: 'another' }; state.fastPoll = true;
     const retry = await transcript(request(await newFlow()));

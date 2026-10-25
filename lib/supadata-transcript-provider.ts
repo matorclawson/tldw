@@ -3,11 +3,16 @@ import { createHash } from 'node:crypto';
 import { AbortManager } from '@/lib/promise-utils';
 
 export const SUPADATA_TIMEOUT_MS = 20_000;
+export const SUPADATA_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const SUPADATA_MAX_RESPONSE_CHUNKS = 65_536;
+export const SUPADATA_MAX_SEGMENTS = 20_000;
+export const SUPADATA_MAX_SEGMENT_CHARS = 16_384;
+export const SUPADATA_MAX_TEXT_CHARS = 2_000_000;
 
 type SupadataFailure =
   | { outcome: 'unavailable'; reason: 'captions_unavailable' | 'empty_content' }
   | { outcome: 'dependency_failure'; reason: 'upstream_failure' | 'malformed_content' | 'cancelled' }
-  | { outcome: 'unknown_upstream_acceptance'; reason: 'unexpected_job' | 'timeout' | 'cancelled' | 'network_failure' };
+  | { outcome: 'unknown_upstream_acceptance'; reason: 'unexpected_job' | 'timeout' | 'cancelled' | 'network_failure' | 'response_limit' };
 
 export interface SupadataMetadata {
   source: 'supadata';
@@ -33,6 +38,55 @@ export function supadataNativeCacheIdentity(videoId: string, lang?: string): str
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+class ResponseLimitError extends Error {}
+class MalformedBodyError extends Error {}
+
+function cancelBody(response: Response): void {
+  void response.body?.cancel().catch(() => {});
+}
+
+/** Enforce the actual bytes even when Content-Length is absent or deceptive. */
+async function readBoundedJson(response: Response, signal: AbortSignal): Promise<unknown> {
+  const declared = response.headers.get('content-length');
+  if (declared !== null && /^\d+$/.test(declared.trim()) && Number(declared) > SUPADATA_MAX_RESPONSE_BYTES) {
+    cancelBody(response);
+    throw new ResponseLimitError();
+  }
+  if (!response.body) throw new MalformedBodyError();
+  const reader = response.body.getReader();
+  let cancelled = false;
+  const cancel = () => {
+    if (!cancelled) {
+      cancelled = true;
+      void reader.cancel().catch(() => {});
+    }
+  };
+  signal.addEventListener('abort', cancel, { once: true });
+  let complete = false;
+  try {
+    // Fixed capacity also bounds bookkeeping for arbitrarily many tiny chunks.
+    const bytes = new Uint8Array(SUPADATA_MAX_RESPONSE_BYTES);
+    let length = 0;
+    let chunks = 0;
+    while (true) {
+      if (signal.aborted) throw signal.reason;
+      const { done, value } = await reader.read();
+      if (signal.aborted) throw signal.reason;
+      if (done) { complete = true; break; }
+      if (++chunks > SUPADATA_MAX_RESPONSE_CHUNKS) throw new ResponseLimitError();
+      if (value.byteLength > bytes.length - length) throw new ResponseLimitError();
+      bytes.set(value, length);
+      length += value.byteLength;
+    }
+    try { return JSON.parse(new TextDecoder().decode(bytes.subarray(0, length))); }
+    catch { throw new MalformedBodyError(); }
+  } finally {
+    signal.removeEventListener('abort', cancel);
+    if (!complete) cancel();
+    reader.releaseLock();
+  }
 }
 
 /** Exactly one native-only attempt. Cancellation bounds local waiting, not vendor work or billing. */
@@ -70,18 +124,29 @@ export async function fetchSupadataTranscript(input: {
       headers: { 'x-api-key': input.apiKey, 'x-request-id': input.requestId },
     });
     // A late response must not mutate an already-emitted timeout result.
-    if (finished) return failure({ outcome: 'unknown_upstream_acceptance', reason: 'timeout' });
+    if (finished) {
+      cancelBody(response);
+      return failure({ outcome: 'unknown_upstream_acceptance', reason: 'timeout' });
+    }
     metadata.upstreamStatus = response.status;
     const header = response.headers.get('x-billable-requests');
     if (header !== null && /^\d+(?:\.\d+)?$/.test(header.trim()) && Number.isFinite(Number(header))) {
       metadata.billableCredits = Number(header);
       metadata.billingKind = response.status === 202 ? 'precharge_estimate' : 'reported';
     }
-    if (response.status === 206) return failure({ outcome: 'unavailable', reason: 'captions_unavailable' });
-    if (response.status !== 200 && response.status !== 202) return failure({ outcome: 'dependency_failure', reason: 'upstream_failure' });
+    if (response.status === 206) {
+      cancelBody(response);
+      return failure({ outcome: 'unavailable', reason: 'captions_unavailable' });
+    }
+    if (response.status !== 200 && response.status !== 202) {
+      cancelBody(response);
+      return failure({ outcome: 'dependency_failure', reason: 'upstream_failure' });
+    }
 
     let body: unknown;
-    try { body = await response.json(); } catch {
+    try { body = await readBoundedJson(response, controller.signal); } catch (error) {
+      if (error instanceof ResponseLimitError) return failure({ outcome: 'unknown_upstream_acceptance', reason: 'response_limit' });
+      if (controller.signal.aborted || !(error instanceof MalformedBodyError)) throw error;
       return response.status === 202
         ? failure({ outcome: 'unknown_upstream_acceptance', reason: 'unexpected_job' })
         : failure({ outcome: 'dependency_failure', reason: 'malformed_content' });
@@ -97,12 +162,18 @@ export async function fetchSupadataTranscript(input: {
     }
     if (!record(body) || !Array.isArray(body.content)) return failure({ outcome: 'dependency_failure', reason: 'malformed_content' });
     if (body.content.length === 0) return failure({ outcome: 'unavailable', reason: 'empty_content' });
+    if (body.content.length > SUPADATA_MAX_SEGMENTS) return failure({ outcome: 'unknown_upstream_acceptance', reason: 'response_limit' });
     const segments: { text: string; start: number; duration: number }[] = [];
+    let textChars = 0;
     for (const item of body.content) {
       if (!record(item) || typeof item.text !== 'string'
         || typeof item.offset !== 'number' || !Number.isFinite(item.offset) || item.offset < 0
         || typeof item.duration !== 'number' || !Number.isFinite(item.duration) || item.duration < 0) {
         return failure({ outcome: 'dependency_failure', reason: 'malformed_content' });
+      }
+      textChars += item.text.length;
+      if (item.text.length > SUPADATA_MAX_SEGMENT_CHARS || textChars > SUPADATA_MAX_TEXT_CHARS) {
+        return failure({ outcome: 'unknown_upstream_acceptance', reason: 'response_limit' });
       }
       const text = item.text.trim().replace(/^>>\s*/gm, '').trim();
       if (!text) return failure({ outcome: 'dependency_failure', reason: 'malformed_content' });
